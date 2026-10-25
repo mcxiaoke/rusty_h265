@@ -89,8 +89,23 @@ pub trait CabacObserver {
     /// Calls arrive in the same order as the matching sign records, DC
     /// `(0, 0)` excluded on both sides. `abs_dq` is the dequantized value
     /// that reaches the inverse transform (spec 8.6.3 `bdShift` applied).
+    ///
+    /// `sample_domain` is true when the block is **not** transformed — either
+    /// `transform_skip_flag` or `cu_transquant_bypass_flag` — so `abs_dq`
+    /// already is a residual *sample*: flipping the sign moves that one sample,
+    /// with no inverse-transform basis spreading it over the block. Cost models
+    /// that divide by a basis peak (64) must not do so here.
     #[inline]
-    fn record_stego_level(&mut self, _x_c: u8, _y_c: u8, _abs_level: u32, _abs_dq: i32, _bit_depth: u8) {}
+    fn record_stego_level(
+        &mut self,
+        _x_c: u8,
+        _y_c: u8,
+        _abs_level: u32,
+        _abs_dq: i32,
+        _bit_depth: u8,
+        _sample_domain: bool,
+    ) {
+    }
 
     /// Records a terminate bin.
     fn record_terminate(&mut self, bit: u32);

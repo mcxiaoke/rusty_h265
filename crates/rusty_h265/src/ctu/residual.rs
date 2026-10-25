@@ -597,6 +597,10 @@ impl<'a, 'o> SliceDecoder<'a, 'o> {
                 // `record_stego_sign`; the sign-hidden coefficient
                 // (`k == nsig - 1`) never had one.
                 if obs_active && k < nsigns {
+                    // Neither path transforms the block, so the reported
+                    // magnitude already is a residual sample: the cost model
+                    // must not apply the inverse-transform basis peak.
+                    let sample_domain = transform_skip || self.cu_transquant_bypass;
                     let abs_dq = if self.cu_transquant_bypass {
                         abs
                     } else {
@@ -609,7 +613,7 @@ impl<'a, 'o> SliceDecoder<'a, 'o> {
                         }
                     };
                     if let Some(obs) = &mut cab.observer {
-                        obs.record_stego_level(xc as u8, yc as u8, abs as u32, abs_dq, bd);
+                        obs.record_stego_level(xc as u8, yc as u8, abs as u32, abs_dq, bd, sample_domain);
                     }
                 }
                 co[yc * n + xc] = v.clamp(-32768, 32767);
