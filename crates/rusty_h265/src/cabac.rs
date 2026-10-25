@@ -9,6 +9,8 @@
 
 use rusty_h265_accel as accel;
 
+use crate::observer::CabacObserver;
+
 /// `rangeTabLps[pStateIdx][(ivlCurrRange >> 6) & 3]` (Table 9-46).
 #[rustfmt::skip]
 pub const RANGE_LPS: [[u8; 4]; 64] = [
@@ -258,7 +260,7 @@ impl Contexts {
 }
 
 /// The arithmetic decoder over one slice segment's RBSP.
-pub struct Cabac<'a> {
+pub struct Cabac<'a, 'o> {
     data: &'a [u8],
     byte_pos: usize,
     /// `low = ivlOffset · 2^41 + buffered bits (< 2^41)`.
@@ -266,15 +268,28 @@ pub struct Cabac<'a> {
     cnt: i32,
     range: u32,
     pub ctx: Contexts,
+    /// Steganography observer, attached for one `decode_nal_with_observer`
+    /// call. Its lifetime is independent of the bitstream borrow: the
+    /// recorder outlives the whole call, the slice data does not.
+    pub observer: Option<&'o mut dyn CabacObserver>,
     #[cfg(feature = "cabac-trace")]
     trace: bool,
     #[cfg(feature = "cabac-trace")]
     sym: u64,
 }
 
-impl<'a> Cabac<'a> {
+impl<'a, 'o> Cabac<'a, 'o> {
     /// Starts the engine at byte `start` of `data` (§9.3.2.5) with `ctx`.
     pub fn new(data: &'a [u8], start: usize, ctx: Contexts) -> Self {
+        Self::build(data, start, ctx, None)
+    }
+
+    /// [`Cabac::new`] with a steganography observer attached.
+    pub fn new_with_observer(data: &'a [u8], start: usize, ctx: Contexts, observer: &'o mut dyn CabacObserver) -> Self {
+        Self::build(data, start, ctx, Some(observer))
+    }
+
+    fn build(data: &'a [u8], start: usize, ctx: Contexts, observer: Option<&'o mut dyn CabacObserver>) -> Self {
         let mut e = Cabac {
             data,
             byte_pos: start,
@@ -282,6 +297,7 @@ impl<'a> Cabac<'a> {
             cnt: 0,
             range: 510,
             ctx,
+            observer,
             #[cfg(feature = "cabac-trace")]
             trace: std::env::var_os("RH265_CABAC_TRACE").is_some(),
             #[cfg(feature = "cabac-trace")]
@@ -396,6 +412,9 @@ impl<'a> Cabac<'a> {
         self.ctx.0[ctx_idx] = ((e >> (8 + (mask & 8))) & 0xFF) as u8;
         let bin = (s as u32 ^ mask) & 1;
         self.renorm();
+        if let Some(obs) = &mut self.observer {
+            obs.record_decision(ctx_idx, bin);
+        }
         bin
     }
 
@@ -431,6 +450,9 @@ impl<'a> Cabac<'a> {
         }
         let (low, bin) = Self::bypass_cmp(self.low, (self.range as u64) << OFF);
         self.low = low;
+        if let Some(obs) = &mut self.observer {
+            obs.record_bypass(bin);
+        }
         bin
     }
 
@@ -442,6 +464,16 @@ impl<'a> Cabac<'a> {
     /// instead of round-tripping through the struct once per bin.
     #[inline]
     pub fn bypass_bits(&mut self, n: u32) -> u32 {
+        self.bypass_bits_inner(n, true)
+    }
+
+    /// [`Cabac::bypass_bits`], optionally reporting each bin to the observer.
+    ///
+    /// `record = false` is for callers that re-report the bins themselves with
+    /// richer metadata (the sign-bit path); `record = true` mirrors the
+    /// per-bin `bypass()` stream the observer contract expects.
+    #[inline]
+    fn bypass_bits_inner(&mut self, n: u32, record: bool) -> u32 {
         if accel::census::ALWAYS {
             accel::census::bump(&accel::census::CABAC_BYPASS_CALLS, 1);
             accel::census::bump(&accel::census::CABAC_BYPASS_BINS, n as u64);
@@ -468,10 +500,36 @@ impl<'a> Cabac<'a> {
             let (l, bin) = Self::bypass_cmp(low, scaled);
             low = l;
             v = (v << 1) | bin;
+            if record {
+                if let Some(obs) = &mut self.observer {
+                    obs.record_bypass(bin);
+                }
+            }
         }
         self.low = low;
         self.cnt = cnt;
         v
+    }
+
+    /// `n` bypass **sign** bits (MSB first), each reported to the observer as
+    /// a steganographic slot candidate with its coefficient's coding metadata.
+    ///
+    /// Bit-identical to `bypass_bits(n)` — one batch read — but the observer
+    /// receives `record_stego_sign` per bin instead of `record_bypass`, with
+    /// `coords[k]` giving the `(x_c, y_c)` of the coefficient whose sign is
+    /// bit `k`. `coords` shorter than `n` stops the reports early (defensive).
+    #[inline]
+    pub fn bypass_sign_bits(&mut self, n: u32, qp: i32, trafo_size: u8, c_idx: u8, coords: &[(u8, u8)]) -> u32 {
+        let bits = self.bypass_bits_inner(n, false);
+        if let Some(obs) = &mut self.observer {
+            for k in 0..n as usize {
+                let bit = (bits >> (n - 1 - k as u32)) & 1;
+                if let Some(&(x, y)) = coords.get(k) {
+                    obs.record_stego_sign(bit, qp, trafo_size, c_idx, x, y);
+                }
+            }
+        }
+        bits
     }
 
     /// Bypass bins until one decodes 0, or until `max` of them decode 1;
@@ -503,12 +561,22 @@ impl<'a> Cabac<'a> {
             }
             low -= scaled;
             k += 1;
+            if let Some(obs) = &mut self.observer {
+                obs.record_bypass(1);
+            }
         }
         self.low = low;
         self.cnt = cnt;
         if accel::census::ALWAYS {
             accel::census::bump(&accel::census::CABAC_BYPASS_CALLS, 1);
             accel::census::bump(&accel::census::CABAC_BYPASS_BINS, (k + 1).min(max) as u64);
+        }
+        // The terminating 0 bin was consumed whenever the loop broke early;
+        // at the `max` cap no zero was read.
+        if k < max {
+            if let Some(obs) = &mut self.observer {
+                obs.record_bypass(0);
+            }
         }
         k
     }
@@ -521,7 +589,11 @@ impl<'a> Cabac<'a> {
         }
         self.tr("T", self.low);
         self.range -= 2;
-        if self.low >= (self.range as u64) << OFF {
+        let t = self.low >= (self.range as u64) << OFF;
+        if let Some(obs) = &mut self.observer {
+            obs.record_terminate(t as u32);
+        }
+        if t {
             true
         } else {
             self.renorm();

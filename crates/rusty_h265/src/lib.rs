@@ -39,6 +39,7 @@ pub mod itx;
 mod mcscratch;
 pub mod md5;
 pub mod nal;
+pub mod observer;
 pub mod pic;
 #[cfg(feature = "prof")]
 pub mod prof;

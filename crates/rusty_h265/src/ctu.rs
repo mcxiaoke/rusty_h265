@@ -15,6 +15,7 @@ use crate::decoder::{RefLists, RefPic};
 use crate::error::{Error, Result};
 use crate::frame::Picture;
 use crate::nal::Rbsp;
+use crate::observer::CabacObserver;
 use crate::pic::{CtbFilterParams, PicState, SaoParams, PRED_INTER, PRED_INTRA, PRED_SKIP};
 use crate::ps::{Pps, ScalingList, Sps, TileLayout};
 use crate::slice::{SliceHeader, SliceType};
@@ -106,7 +107,7 @@ impl ScalingFactors {
     }
 }
 
-pub struct SliceDecoder<'a> {
+pub struct SliceDecoder<'a, 'o> {
     sps: &'a Sps,
     pps: &'a Pps,
     sh: &'a SliceHeader,
@@ -115,7 +116,7 @@ pub struct SliceDecoder<'a> {
     st: &'a mut PicState,
     store: &'a mut CtxStore,
     rbsp: &'a Rbsp,
-    cab: Cabac<'a>,
+    cab: Cabac<'a, 'o>,
     scaling: Option<&'a ScalingFactors>,
     refs: &'a RefLists,
     poc: i32,
@@ -129,6 +130,11 @@ pub struct SliceDecoder<'a> {
     /// Substream start offsets in the RBSP (from the entry points).
     substreams: Vec<usize>,
     substream_idx: usize,
+    /// `(idx, rbsp_byte_start)` of a substream the loop has switched to but
+    /// whose context state is only final at the top of the next CTU iteration
+    /// (after the WPP/tile init-or-inherit branch). Reported to the observer
+    /// there, so `init_contexts` is the state the substream truly starts from.
+    pending_substream: Option<(usize, usize)>,
     // QP state (§8.6.1)
     qp_y: i32,
     qp_y_pred: i32,
@@ -195,7 +201,7 @@ impl Ablate {
 }
 
 /// One-time inputs to build a [`SliceDecoder`].
-pub struct SliceInputs<'a> {
+pub struct SliceInputs<'a, 'o> {
     pub sps: &'a Sps,
     pub pps: &'a Pps,
     pub sh: &'a SliceHeader,
@@ -210,6 +216,8 @@ pub struct SliceInputs<'a> {
     pub ablate: Ablate,
     pub slice_addr_rs: i32,
     pub slice_idx: u16,
+    /// Steganography observer, forwarded to the slice's [`Cabac`].
+    pub observer: Option<&'o mut dyn CabacObserver>,
 }
 
 /// Exact division by a value that is constant for the whole picture.
@@ -274,8 +282,8 @@ pub(crate) fn wrap_qp(v: i32, qp_bd_offset: i32) -> i32 {
     t - qp_bd_offset
 }
 
-impl<'a> SliceDecoder<'a> {
-    pub fn new(inp: SliceInputs<'a>) -> Result<Self> {
+impl<'a, 'o> SliceDecoder<'a, 'o> {
+    pub fn new(inp: SliceInputs<'a, 'o>) -> Result<Self> {
         let sh = inp.sh;
         // Taken before `inp` is consumed below.
         let ctb_div = CtbDiv::new(inp.st.ctb_w.max(1));
@@ -320,7 +328,10 @@ impl<'a> SliceDecoder<'a> {
             }
             substreams.push(r);
         }
-        let cab = Cabac::new(&rbsp.data, sh.data_offset, Contexts::init(init_type, sh.slice_qp));
+        let cab = match inp.observer {
+            Some(obs) => Cabac::new_with_observer(&rbsp.data, sh.data_offset, Contexts::init(init_type, sh.slice_qp), obs),
+            None => Cabac::new(&rbsp.data, sh.data_offset, Contexts::init(init_type, sh.slice_qp)),
+        };
         let ds_qp = inp.store.ds_qp;
         let refs = inp.refs;
         let no_backward_pred = refs.l0.iter().chain(refs.l1.iter()).all(|r| r.poc <= inp.poc);
@@ -350,6 +361,7 @@ impl<'a> SliceDecoder<'a> {
             init_type,
             substreams,
             substream_idx: 0,
+            pending_substream: None,
             qp_y: sh.slice_qp,
             qp_y_pred: sh.slice_qp,
             last_cu_qp: if sh.dependent_slice_segment { ds_qp.unwrap_or(sh.slice_qp) } else { sh.slice_qp },
@@ -411,6 +423,13 @@ impl<'a> SliceDecoder<'a> {
                 self.cab.ctx = c.clone();
             }
         }
+        // Substream 0 of the segment, reported with the context state it
+        // actually starts from (inherited for dependent segments, initialised
+        // otherwise).
+        let snap = crate::observer::context_snapshot(&self.cab.ctx);
+        if let Some(obs) = &mut self.cab.observer {
+            obs.start_substream(0, self.sh.data_offset, &snap);
+        }
         let mut segment_start = true;
         loop {
             // Context initialisation / synchronisation at the CTU start (§9.3.1).
@@ -434,6 +453,15 @@ impl<'a> SliceDecoder<'a> {
                 }
                 self.qp_prev_reset = true;
             }
+            // Report the substream the previous CTU switched to, now that its
+            // initial context state (WPP inheritance or fresh tile init) is
+            // final.
+            if let Some((idx, start)) = self.pending_substream.take() {
+                let snap = crate::observer::context_snapshot(&self.cab.ctx);
+                if let Some(obs) = &mut self.cab.observer {
+                    obs.start_substream(idx, start, &snap);
+                }
+            }
             segment_start = false;
 
             self.decode_ctu(rs, x0, y0)?;
@@ -449,6 +477,9 @@ impl<'a> SliceDecoder<'a> {
                 if self.pps.dependent_slice_segments_enabled {
                     self.store.ds = Some(self.cab.ctx.clone());
                     self.store.ds_qp = Some(self.last_cu_qp);
+                }
+                if let Some(obs) = &mut self.cab.observer {
+                    obs.finish_slice(self.rbsp.data.len());
                 }
                 return Ok(());
             }
@@ -468,6 +499,7 @@ impl<'a> SliceDecoder<'a> {
                     Some(&s) => s,
                     None => natural,
                 };
+                self.pending_substream = Some((self.substream_idx, start));
                 if self.dbg_sub {
                     eprintln!(
                         "sub poc={} next_rs={rs} idx={} entry_start={start} natural={natural} nsub={}",

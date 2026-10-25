@@ -59,6 +59,26 @@ pub fn dequant(coeffs: &mut [i32], n: usize, nz_w: usize, nz_h: usize, qp: i32, 
     }
 }
 
+/// §8.6.3 for a single coefficient at `(x, y)` of an `n x n` block: the value
+/// [`dequant`] would store at that position.
+///
+/// Used by the steganography observer to report the magnitude a sign flip
+/// would move — it must be the value the reconstruction actually sees, so it
+/// shares [`dequant`]'s arithmetic term for term. Zero levels report 0.
+#[inline]
+pub fn dequant_one(level: i32, x: usize, y: usize, n: usize, qp: i32, bit_depth: u8, m: Option<&[u8]>) -> i32 {
+    if level == 0 {
+        return 0;
+    }
+    let log2n = n.trailing_zeros() as i32;
+    let bd_shift = bit_depth as i32 + log2n - 5;
+    let scale = LEVEL_SCALE[(qp % 6) as usize] << (qp / 6);
+    let add = 1i64 << (bd_shift - 1);
+    let f = m.map_or(16, |t| t[y * n + x] as i32);
+    let v = ((level as i64 * f as i64 * scale as i64) + add) >> bd_shift;
+    v.clamp(COEFF_MIN as i64, COEFF_MAX as i64) as i32
+}
+
 /// Bring-up switch: `RH265_NO_DC_FAST=1` sends DC-only blocks down the general
 /// transform, so the collapse can be A/B'd inside one binary. Default OFF —
 /// the fast path ships.

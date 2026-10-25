@@ -12,7 +12,25 @@ use crate::pic::{PicState, PRED_INTRA};
 use crate::tables::{scan_set, CHROMA_QP_420};
 use rusty_h265_accel as accel;
 
-impl<'a> SliceDecoder<'a> {
+impl<'a, 'o> SliceDecoder<'a, 'o> {
+    /// Effective QP of a transform block of component `c_idx` (§8.6.1):
+    /// the per-CU luma QP plus the bit-depth offset and, for chroma, the
+    /// 4:2:0 chroma QP mapping. Shared by `reconstruct_residual` and the
+    /// observer's magnitude back-fill so both price the same coefficient
+    /// with the same step size.
+    pub(crate) fn block_qp(&self, c_idx: usize) -> i32 {
+        if c_idx == 0 {
+            return self.qp_y + self.sps.qp_bd_offset_y;
+        }
+        let off = if c_idx == 1 {
+            self.pps.cb_qp_offset + self.sh.cb_qp_offset
+        } else {
+            self.pps.cr_qp_offset + self.sh.cr_qp_offset
+        };
+        let qpi = (self.qp_y + off).clamp(-self.sps.qp_bd_offset_c, 57);
+        let qpc = if qpi < 0 { qpi } else { CHROMA_QP_420[qpi as usize] as i32 };
+        qpc + self.sps.qp_bd_offset_c
+    }
     #[allow(clippy::too_many_arguments)]
     pub(super) fn transform_tree(&mut self, x0: usize, y0: usize, xbase: usize, ybase: usize, log2: usize, depth: u8, blk_idx: usize, parent_cbf_cb: bool, parent_cbf_cr: bool) -> Result<()> {
         let max_tb = self.sps.log2_max_tb_size as usize;
@@ -249,11 +267,35 @@ impl<'a> SliceDecoder<'a> {
         // The clear of `self.coeffs` used to be here, before anything was
         // known about the block. It is now below, once the last-significant
         // position says how much of the block is live.
+        //
+        // Observer metadata is hoisted before the `cab` borrow: the block's
+        // QP and bit depth are fixed for the whole block, and reading them
+        // through `&self` while `cab` is borrowed would not compile.
+        let obs_active = self.cab.observer.is_some();
+        let (qp_eff, bd) = if obs_active {
+            (self.block_qp(c_idx), if c_idx == 0 { self.sps.bit_depth_luma } else { self.sps.bit_depth_chroma })
+        } else {
+            (0, 0)
+        };
         let cab = &mut self.cab;
         let mut transform_skip = false;
         if self.pps.transform_skip_enabled && !self.cu_transquant_bypass && log2 <= self.pps.log2_max_transform_skip_block_size as usize {
             transform_skip = cab.decode(CTX_TRANSFORM_SKIP + if c_idx > 0 { 1 } else { 0 }) == 1;
         }
+        // Scaling matrix for the observer's magnitude back-fill — the same
+        // selection `reconstruct_residual` makes below.
+        let obs_m: Option<&[u8]> = if obs_active {
+            match self.scaling {
+                Some(sf) if !(transform_skip && n > 4) => {
+                    let size_id = log2 - 2;
+                    let matrix_id = if self.cu_intra { 0 } else { 3 } + c_idx;
+                    Some(sf.get(size_id, matrix_id))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
         // last_sig_coeff_{x,y}_prefix / suffix
         let (ctx_off, ctx_shift) = if c_idx == 0 { (3 * (log2 - 2) + ((log2 - 1) >> 2), (log2 + 1) >> 2) } else { (15, log2 - 2) };
         let cmax = (log2 << 1) - 1;
@@ -479,6 +521,20 @@ impl<'a> SliceDecoder<'a> {
             let last_sig = sig_pos[0] as usize;
             let sign_hidden = sign_hiding && last_sig - first_sig > 3;
             let nsigns = if sign_hidden { nsig - 1 } else { nsig };
+            // Coefficient coordinates of the transmitted sign bits, in the
+            // order the bits are consumed: bit `k` is the sign of the
+            // coefficient at `sig_pos[k]` (descending scan position). When
+            // sign data hiding is active the last coefficient in that order
+            // carries no transmitted sign and is skipped here, mirroring
+            // `nsigns = nsig - 1`.
+            let mut sign_coords = [(0u8, 0u8); 16];
+            if obs_active {
+                for k in 0..nsigns {
+                    let np = sig_pos[k & 15] as usize;
+                    let (xp, yp) = (pos_scan[np & 15].0, pos_scan[np & 15].1);
+                    sign_coords[k] = (((xs << 2) + xp as usize) as u8, ((ys << 2) + yp as usize) as u8);
+                }
+            }
             // Pre-align the sign bits so each coefficient reads the top one.
             //
             // The old form recovered bit `nsigns - 1 - k` per coefficient: two
@@ -490,7 +546,7 @@ impl<'a> SliceDecoder<'a> {
             // `wrapping_shl` masks its operand to 0..=31, so `nsigns == 0`
             // shifts by 0; `signs` is then 0 anyway, so the result still reads
             // as all-positive.
-            let mut sbits = cab.bypass_bits(nsigns as u32).wrapping_shl(32 - nsigns as u32);
+            let mut sbits = cab.bypass_sign_bits(nsigns as u32, qp_eff, n as u8, c_idx as u8, &sign_coords).wrapping_shl(32 - nsigns as u32);
             // coeff_abs_level_remaining
             let mut rice = 0u32;
             let mut sum_abs = 0i32;
@@ -529,6 +585,33 @@ impl<'a> SliceDecoder<'a> {
                 let yc = (ys << 2) + yp;
                 nz_w = nz_w.max(xc + 1);
                 nz_h = nz_h.max(yc + 1);
+                // Observer back-fill for this coefficient's sign slot: the
+                // magnitude a flip actually moves. §8.6.3 yields `d`; for a
+                // transform-skip block the spec then applies (8-298)
+                // `d << tsShift` (tsShift = 5 + Log2(nTbS)) and (8-299)
+                // `>> bdShift` (bdShift = Max(20 − bitDepth, …)), which nets
+                // out to `d >> (15 − bitDepth − Log2(n))` in the sample
+                // domain. Report that domain for skip blocks so their cost is
+                // comparable with the transform path's. Only coefficients with
+                // a transmitted sign (`k < nsigns`) pair with a
+                // `record_stego_sign`; the sign-hidden coefficient
+                // (`k == nsig - 1`) never had one.
+                if obs_active && k < nsigns {
+                    let abs_dq = if self.cu_transquant_bypass {
+                        abs
+                    } else {
+                        let d = itx::dequant_one(abs, xc, yc, n, qp_eff, bd, obs_m);
+                        let ts_shift = 15 - bd as i32 - log2 as i32;
+                        if transform_skip && ts_shift > 0 {
+                            (d + (1 << (ts_shift - 1))) >> ts_shift
+                        } else {
+                            d
+                        }
+                    };
+                    if let Some(obs) = &mut cab.observer {
+                        obs.record_stego_level(xc as u8, yc as u8, abs as u32, abs_dq, bd);
+                    }
+                }
                 co[yc * n + xc] = v.clamp(-32768, 32767);
             }
         }
@@ -573,18 +656,7 @@ impl<'a> SliceDecoder<'a> {
             TransformKind::Dct
         };
         if kind != TransformKind::Bypass {
-            let qp = if c_idx == 0 {
-                self.qp_y + sps.qp_bd_offset_y
-            } else {
-                let off = if c_idx == 1 {
-                    self.pps.cb_qp_offset + self.sh.cb_qp_offset
-                } else {
-                    self.pps.cr_qp_offset + self.sh.cr_qp_offset
-                };
-                let qpi = (self.qp_y + off).clamp(-sps.qp_bd_offset_c, 57);
-                let qpc = if qpi < 0 { qpi } else { CHROMA_QP_420[qpi as usize] as i32 };
-                qpc + sps.qp_bd_offset_c
-            };
+            let qp = self.block_qp(c_idx);
             let m: Option<&[u8]> = match self.scaling {
                 Some(sf) if !(transform_skip && n > 4) => {
                     let size_id = log2 - 2;

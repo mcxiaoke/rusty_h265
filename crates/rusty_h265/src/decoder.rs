@@ -11,6 +11,7 @@ use crate::ctu::{Ablate, CtxStore, ScalingFactors, SliceDecoder, SliceInputs};
 use crate::error::{Error, Result};
 use crate::frame::{Frame, Picture};
 use crate::nal::{split_annex_b, unescape, NalHeader, NalType, Rbsp};
+use crate::observer::CabacObserver;
 use crate::pic::PicState;
 use crate::ps::{parse_pps, parse_sps, parse_vps, Pps, Sps, TileLayout, Vps, PROFILE_MAIN, PROFILE_MAIN10, PROFILE_MAIN_STILL};
 use crate::sei::{self, PictureHash};
@@ -323,6 +324,12 @@ impl Decoder {
     }
 
     fn push_slice(&mut self, hdr: &NalHeader, rbsp: Rbsp) -> Result<()> {
+        self.push_slice_obs(hdr, rbsp, None)
+    }
+
+    /// [`Decoder::push_slice`] with an optional steganography observer,
+    /// forwarded to the slice segment's [`Cabac`].
+    fn push_slice_obs(&mut self, hdr: &NalHeader, rbsp: Rbsp, observer: Option<&mut dyn CabacObserver>) -> Result<()> {
         let mut r = BitReader::new(&rbsp.data);
         // Peek first_slice_segment_in_pic_flag: a new picture ends the old one.
         let first = r.peek_bits(1) == 1;
@@ -398,6 +405,7 @@ impl Decoder {
             ablate: self.ablate,
             slice_addr_rs: cur.slice_addr_rs,
             slice_idx,
+            observer,
         })
         .and_then(|d| d.decode());
         if let Err(e) = r {
@@ -405,6 +413,30 @@ impl Decoder {
             return Err(e);
         }
         Ok(())
+    }
+
+    /// Feeds one NAL unit (header + escaped payload, no start code) with a
+    /// steganography observer attached to the slice's CABAC engine.
+    ///
+    /// Non-VCL NALs fall back to the plain [`Decoder::push_nal`] path — the
+    /// observer contract only covers slice segment data.
+    pub fn decode_nal_with_observer(&mut self, nal: &[u8], observer: &mut dyn CabacObserver) -> Result<Option<Frame>> {
+        let hdr = NalHeader::parse(nal).ok_or_else(|| Error::invalid("bad NAL header"))?;
+        if hdr.layer_id != 0 {
+            // Enhancement layers (SHVC/MV-HEVC) are ignored.
+            return Ok(None);
+        }
+        if !hdr.nal_type.is_vcl() {
+            self.push_nal(nal, None)?;
+            return Ok(None);
+        }
+        if hdr.nal_type.id() >= 22 {
+            // reserved VCL types: ignore
+            return Ok(None);
+        }
+        let rbsp = unescape(&nal[2..]);
+        self.push_slice_obs(&hdr, rbsp, Some(observer))?;
+        Ok(None)
     }
 
     fn start_picture(&mut self, hdr: &NalHeader, sh: &SliceHeader) -> Result<()> {
@@ -584,7 +616,11 @@ impl Decoder {
             });
             if std::env::var_os("RH265_POOL").is_some() {
                 use std::sync::atomic::Ordering;
-                if recycled.is_some() { POOL_HIT.fetch_add(1, Ordering::Relaxed) } else { POOL_MISS.fetch_add(1, Ordering::Relaxed) };
+                if recycled.is_some() {
+                    POOL_HIT.fetch_add(1, Ordering::Relaxed)
+                } else {
+                    POOL_MISS.fetch_add(1, Ordering::Relaxed)
+                };
             }
             match recycled {
                 Some(p) => p,

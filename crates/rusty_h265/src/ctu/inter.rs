@@ -185,7 +185,7 @@ fn neutral_weights(t: &PredWeightTable, pu: &PuMv, used: [bool; 2], c: usize, of
     true
 }
 
-impl<'a> SliceDecoder<'a> {
+impl<'a, 'o> SliceDecoder<'a, 'o> {
     /// Parses and predicts every PU of an inter CU. Returns `merge_flag` of a 2N×2N PU.
     pub(super) fn inter_prediction_units(&mut self, x0: usize, y0: usize, n: usize, depth: u8) -> Result<bool> {
         let h = n / 2;
