@@ -181,6 +181,8 @@ pub struct Decoder {
     pub stats: Stats,
     /// Bring-up: decode nothing past the slice header (Phase 1).
     pub headers_only: bool,
+    /// Skip in-loop deblocking and SAO filters completely.
+    pub skip_loop_filters: bool,
     /// `RH265_TRACE=1`: one line per picture boundary on stderr.
     trace: bool,
 }
@@ -217,8 +219,23 @@ impl Decoder {
             sei_results: Vec::new(),
             stats: Stats::default(),
             headers_only: false,
+            skip_loop_filters: false,
             trace: std::env::var_os("RH265_TRACE").is_some(),
         }
+    }
+
+    /// Resets DPB and sequence state so the decoder can cleanly start a new GOP
+    /// or independent chunk without carrying over reference frames or RASL skip state.
+    pub fn reset_sequence(&mut self) {
+        self.dpb.clear();
+        self.output.clear();
+        self.cur = None;
+        self.prev_tid0_poc = 0;
+        self.first_in_sequence = true;
+        self.no_rasl_output_flag = true;
+        self.skipping_picture = false;
+        self.pending_pts = None;
+        self.pending_hash = None;
     }
 
     /// Feeds an Annex-B chunk (any number of NAL units, e.g. one access unit).
@@ -551,7 +568,7 @@ impl Decoder {
             let _ = sps_changed;
             let no_output_of_prior_pics = nt.is_cra() || sh.no_output_of_prior_pics;
             if no_output_of_prior_pics {
-                for e in self.dpb.drain(..).collect::<Vec<_>>() {
+                for e in std::mem::take(&mut self.dpb) {
                     self.reclaim(e);
                 }
             } else {
@@ -604,7 +621,8 @@ impl Decoder {
             let (w, h) = (sps.width as usize, sps.height as usize);
             // A pattern guard cannot take `p` by mutable reference, so the
             // reuse attempt happens before the match.
-            let recycled = self.pic_pool.pop().filter(|_| true).and_then(|mut p| {
+            #[allow(clippy::manual_filter)]
+            let recycled = self.pic_pool.pop().and_then(|mut p| {
                 if p.reuse(w, h, sps.chroma_format_idc, sps.bit_depth_luma, sps.bit_depth_chroma) {
                     Some(p)
                 } else {
@@ -820,7 +838,9 @@ impl Decoder {
         self.stats.pictures += 1;
         Self::clear_uncovered(&mut cur);
         if !self.headers_only {
-            crate::filters::apply_in_loop_filters(&mut cur, &mut self.filter_scratch);
+            if !self.skip_loop_filters {
+                crate::filters::apply_in_loop_filters(&mut cur, &mut self.filter_scratch);
+            }
             // Compress the motion field to 16×16 for later TMVP (§8.5.3.2.9).
             let st = &cur.state;
             let w16 = st.width.div_ceil(16);
@@ -913,7 +933,7 @@ impl Decoder {
         while self.dpb.iter().any(|e| e.needed_for_output) {
             self.bump();
         }
-        for e in self.dpb.drain(..).collect::<Vec<_>>() {
+        for e in std::mem::take(&mut self.dpb) {
             self.reclaim(e);
         }
     }

@@ -372,6 +372,7 @@ fn scalar_sao() -> bool {
 /// - **Neighbour availability.** Only samples on the one-sample ring at the
 ///   edge of a coding tree block can have an unusable neighbour. The interior
 ///   — which is all but `4·cs` of `cs²` samples — needs no check whatsoever.
+///
 /// Diagnostic: how much of each plane the narrowed SAO copy actually touches.
 pub static SAO_COPIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static SAO_PLANE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
